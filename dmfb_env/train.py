@@ -1,140 +1,188 @@
-#!/usr/bin/python
+"""
+train.py — Single-agent PPO training for DMFB droplet routing.
 
+Paper Section 5.4:
+  - Train on healthy mode until performance matches baseline
+  - Then evaluate on degrading mode
+  - Use 8 concurrent environments (optimal PPO setting from paper)
+  - Each epoch = 20,000 timesteps
+  - Full convergence at ~800K timesteps
+"""
+
+import gym
+import dmfb_env
+import argparse
 import os
-import time
+import numpy as np
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor
+from stable_baselines3.common.callbacks import (
+    EvalCallback, CheckpointCallback, BaseCallback
+)
+from dmfb_env.models.cnn_policy import DMFBCNNPolicy
 
-import matplotlib
-import matplotlib.pyplot as plt
-import tensorflow as tf
+def make_env(size, mode, seed, utilization_lambda=0.0, persist_usage_across_episodes=False):
+    def _init():
+        env = gym.make(
+            'DMFB-v0',
+            size=size,
+            mode=mode,
+            utilization_lambda=utilization_lambda,
+            persist_usage_across_episodes=persist_usage_across_episodes,
+        )
+        env.seed(seed)
+        return env
+    return _init
 
-from utils import OldRouter
-from my_net import MyCnnPolicy
-from envs.dmfb import*
-
-from stable_baselines.common import make_vec_env
-from stable_baselines.common.vec_env import DummyVecEnv
-from stable_baselines.common.policies import MlpPolicy, CnnPolicy, MlpLstmPolicy
-from stable_baselines.common.evaluation import evaluate_policy
-from stable_baselines import PPO2
-
-def legacyReward(env, b_path = False):
-    """ Return the reward of a game if a legacy
-        method is used
+class TrainingProgressCallback(BaseCallback):
     """
-    router = OldRouter(env)
-    return router.getReward(b_path)
+    Logs training progress per epoch.
+    Paper uses epochs of 20,000 timesteps.
+    """
+    def __init__(self, epoch_size=20000, verbose=1):
+        super().__init__(verbose)
+        self.epoch_size = epoch_size
+        self.epoch_rewards = []
+        self.current_epoch_rewards = []
 
-def EvaluatePolicy(model, env,
-        n_eval_episodes = 100, b_path = False):
-    episode_rewards = []
-    legacy_rewards = []
-    n_steps = 0
-    for i in range(n_eval_episodes):
-        obs = env.reset()
-        done, state = False, None
-        episode_reward = 0.0
-        this_loop_steps = 0
-        while not done:
-            action, state = model.predict(obs)
-            obs, reward, done, _info = env.step(action)
-            reward = reward[0]
-            done = done[0]
-            episode_reward += reward
-            n_steps += 1
-            this_loop_steps += 1
-            legacy_r = legacyReward(env.envs[0], b_path)
-        if b_path:
-            episode_rewards.append(this_loop_steps)
-        else:
-            episode_rewards.append(episode_reward)
-        legacy_rewards.append(legacy_r)
-    mean_reward = np.mean(episode_rewards)
-    mean_legacy = np.mean(legacy_rewards)
-    return mean_reward, n_steps, mean_legacy
+    def _on_step(self):
+        if self.locals.get('rewards') is not None:
+            self.current_epoch_rewards.extend(self.locals['rewards'])
 
-def runAnExperiment(
-        env,
-        model = None,
-        num_iterations = 50,
-        num_steps = 20000,
-        policy_steps = 128,
-        b_path = False):
-    if model is None:
-        model = PPO2(MyCnnPolicy, env, n_steps = policy_steps)
-    agent_rewards = []
-    old_rewards = []
-    episodes = []
-    for i in range(num_iterations + 1):
-        model.learn(total_timesteps = num_steps)
-        mean_reward, n_steps, legacy_reward = EvaluatePolicy(model,
-                model.get_env(), n_eval_episodes = 50, b_path = b_path)
-        agent_rewards.append(mean_reward)
-        old_rewards.append(legacy_reward)
-        episodes.append(i)
-    agent_rewards = agent_rewards[-num_iterations:]
-    old_rewards = old_rewards[-num_iterations:]
-    episodes = episodes[:num_iterations]
-    return agent_rewards, old_rewards, episodes
+        if self.num_timesteps % self.epoch_size == 0:
+            if self.current_epoch_rewards:
+                mean_reward = np.mean(self.current_epoch_rewards)
+                self.epoch_rewards.append(mean_reward)
+                if self.verbose:
+                    epoch_num = self.num_timesteps // self.epoch_size
+                    print(f"Epoch {epoch_num:3d} | "
+                          f"Mean Reward: {mean_reward:7.3f} | "
+                          f"Timesteps: {self.num_timesteps:,}")
+                self.current_epoch_rewards = []
+        return True
 
-def showIsGPU():
-    if tf.test.is_gpu_available():
-        print("### Training on GPUs... ###")
-    else:
-        print("### Training on CPUs... ###")
+def train(
+    size=10,
+    total_timesteps=1_000_000,
+    n_envs=8,
+    save_dir='log/',
+    utilization_lambda=0.0,
+    persist_usage_across_episodes=False,
+):
+    """
+    Main training function.
 
-def plotAgentPerformance(a_rewards, o_rewards, size, env_info, b_path = False):
-    a_rewards = np.array(a_rewards)
-    o_rewards = np.array(o_rewards)
-    a_line = np.average(a_rewards, axis = 0)
-    o_line = np.average(o_rewards, axis = 0)
-    a_max = np.max(a_rewards, axis = 0)
-    a_min = np.min(a_rewards, axis = 0)
-    o_max = np.max(o_rewards, axis = 0)
-    o_min = np.min(o_rewards, axis = 0)
-    episodes = list(range(len(a_max)))
-    with plt.style.context('ggplot'):
-        plt.rcParams.update({'font.size': 20})
-        plt.figure()
-        plt.fill_between(episodes, a_max, a_min, facecolor = 'red', alpha = 0.3)
-        plt.fill_between(episodes, o_max, o_min, facecolor = 'blue',
-                alpha = 0.3)
-        plt.plot(episodes, a_line, 'r-', label = 'Agent')
-        plt.plot(episodes, o_line, 'b-', label = 'Baseline')
-        if b_path:
-            leg = plt.legend(loc = 'upper left', shadow = True, fancybox = True)
-        else:
-            leg = plt.legend(loc = 'lower right', shadow = True,
-                    fancybox = True)
-        leg.get_frame().set_alpha(0.5)
-        plt.title("DMFB " + size)
-        plt.xlabel('Training Epochs')
-        if b_path:
-            plt.ylabel('Number of Cycles')
-        else:
-            plt.ylabel('Score')
-        plt.tight_layout()
-        plt.savefig('log/' + size + env_info + '.png')
+    Args:
+      size            : DMFB grid size (N for NxN array)
+      total_timesteps : Total training timesteps
+      n_envs          : Parallel environments
+                        Paper found 8 optimal — Section 5.4
+      save_dir        : Directory to save models and logs
+      utilization_lambda : Fairness shaping weight (0 = paper reward only)
+      persist_usage_across_episodes : If True, usage matrix persists across resets (bioassay)
+    """
+    os.makedirs(save_dir, exist_ok=True)
 
-def expSeveralRuns(args, n_e, n_s, n_repeat):
-    size = str(args['w']) + 'x' + str(args['l'])
-    env_info = '_m' + str(args['n_modules'])
-    env = make_vec_env(DMFBEnv, n_envs = n_e, env_kwargs = args)
-    showIsGPU()
-    a_rewards = []
-    o_rewards = []
-    for i in range(n_repeat):
-        a_r, o_r, episodes = runAnExperiment(env, num_iterations = 50,
-                num_steps = 20000, policy_steps = n_s)
-        a_rewards.append(a_r)
-        o_rewards.append(o_r)
-    plotAgentPerformance(a_rewards, o_rewards, size, env_info)
+    print(f"\n{'='*60}")
+    print(f"Training PPO on {size}x{size} DMFB")
+    print(f"Environments: {n_envs} | Timesteps: {total_timesteps:,}")
+    print(f"utilization_lambda: {utilization_lambda}")
+    print(f"{'='*60}\n")
+
+    # Vectorized training environments — 8 concurrent (paper's optimal)
+    train_env = SubprocVecEnv([
+        make_env(
+            size=size,
+            mode='healthy',
+            seed=i,
+            utilization_lambda=utilization_lambda,
+            persist_usage_across_episodes=persist_usage_across_episodes,
+        )
+        for i in range(n_envs)
+    ])
+    train_env = VecMonitor(train_env)
+
+    eval_env = gym.make(
+        'DMFB-v0',
+        size=size,
+        mode='healthy',
+        utilization_lambda=utilization_lambda,
+        persist_usage_across_episodes=persist_usage_across_episodes,
+    )
+
+    model = PPO(
+        policy='CnnPolicy',
+        env=train_env,
+        learning_rate=3e-4,
+        n_steps=256,
+        batch_size=256,
+        n_epochs=10,
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        ent_coef=0.01,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        verbose=0,
+        tensorboard_log=save_dir,
+        policy_kwargs={
+            "features_extractor_class": DMFBCNNPolicy,
+            "features_extractor_kwargs": {"features_dim": 8},
+            "net_arch": []
+        }
+    )
+
+    progress_cb = TrainingProgressCallback(epoch_size=20000)
+
+    eval_cb = EvalCallback(
+        eval_env,
+        best_model_save_path=save_dir,
+        log_path=save_dir,
+        eval_freq=20000,
+        n_eval_episodes=50,
+        deterministic=True,
+        render=False,
+        verbose=1
+    )
+
+    checkpoint_cb = CheckpointCallback(
+        save_freq=100000,
+        save_path=save_dir,
+        name_prefix='checkpoint'
+    )
+
+    model.learn(
+        total_timesteps=total_timesteps,
+        callback=[progress_cb, eval_cb, checkpoint_cb],
+        reset_num_timesteps=True
+    )
+
+    model.save(os.path.join(save_dir, f'final_model_{size}x{size}'))
+    print(f"\nTraining complete. Model saved to {save_dir}")
+
+    train_env.close()
+    eval_env.close()
+    return model
 
 if __name__ == '__main__':
-    sizes = [15]
-    for s in sizes:
-        args = {'w': s, 'l': s,
-                'n_modules': 0,
-                'b_degrade': True,
-                'per_degrade': 0.1}
-        expSeveralRuns(args, n_e = 1, n_s = 64, n_repeat = 3)
-    print('### Finished train.py successfully ###')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--size', type=int, default=10)
+    parser.add_argument('--timesteps', type=int, default=1_000_000)
+    parser.add_argument('--n_envs', type=int, default=8)
+    parser.add_argument('--save_dir', type=str, default='log/')
+    parser.add_argument('--utilization_lambda', type=float, default=0.0)
+    parser.add_argument(
+        '--persist_usage_across_episodes',
+        action='store_true',
+        help='Keep usage matrix across episode resets (bioassay-style)',
+    )
+    args = parser.parse_args()
+
+    train(
+        size=args.size,
+        total_timesteps=args.timesteps,
+        n_envs=args.n_envs,
+        save_dir=args.save_dir,
+        utilization_lambda=args.utilization_lambda,
+        persist_usage_across_episodes=args.persist_usage_across_episodes,
+    )
